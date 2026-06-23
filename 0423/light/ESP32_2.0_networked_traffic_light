@@ -1,0 +1,473 @@
+/*
+ * ESP32 Traffic Light Controller  —  ACDC SSUNC Phase 2
+ * ======================================================
+ * 3-LED: Red (pin 25), Yellow (pin 27), Green (pin 26)
+ *
+ * Cycle order: RED → GREEN → YELLOW → RED
+ *
+ * Network: STA mode only — ESP32 joins phone hotspot.
+ *   Both ESP32 and Jetson connect to the same hotspot.
+ *   If the hotspot isn't up yet, ESP32 blinks RED and retries every 5s.
+ *   HTTP control and UDP broadcast are only available after STA connects.
+ *
+ * UDP broadcast (port 5005, every 200 ms):
+ *   {"state":"GREEN","seconds_remaining":6.4,"mode":"AUTO","timestamp_ms":12345}
+ *   Jetson v2i_receiver.py listens on this port and parses this JSON.
+ *
+ * HTTP routes:
+ *   /red              Force RED (manual override)
+ *   /yellow           Force YELLOW (manual override)
+ *   /green            Force GREEN (manual override)
+ *   /cycle            Toggle auto-cycle on/off
+ *   /cycle1 .. /cycle9  Set all phases to N seconds each, resume cycling
+ *   /custom?r=X&y=X&g=X  Set individual phase durations (seconds, decimals OK)
+ *   /status           Returns current state, mode, timing, last log ID
+ *   /logs?since=<id>  Returns all log entries newer than <id>
+ *
+ * Serial commands (115200 baud):
+ *   r / R  → Force RED          g / G → Force GREEN
+ *   y / Y  → Force YELLOW       c / C → Toggle cycle
+ *   s / S  → Print status
+ *
+ * Before flashing, set your hotspot credentials in the WIFI CONFIG block below.
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiUdp.h>
+
+// ═══════════════════════════════════════════════════════════
+// WIFI CONFIG  — edit these before flashing
+// ═══════════════════════════════════════════════════════════
+const char* STA_SSID = "Bart Simpson";   // phone hotspot SSID
+const char* STA_PASS = "BartBrok";   // phone hotspot password
+
+// How long to wait per connection attempt before retrying
+const uint32_t WIFI_ATTEMPT_MS = 10000;     // 10s per attempt, then retry
+
+// ═══════════════════════════════════════════════════════════
+// GPIO PINS
+// ═══════════════════════════════════════════════════════════
+#define RED_LED_PIN    25
+#define YELLOW_LED_PIN 27    // NEW — yellow added for Phase 2
+#define GREEN_LED_PIN  26
+
+// ═══════════════════════════════════════════════════════════
+// UDP CONFIG
+// ═══════════════════════════════════════════════════════════
+const uint16_t UDP_PORT         = 5005;    // Jetson v2i_receiver.py listens here
+const uint32_t UDP_INTERVAL_MS  = 200;     // broadcast every 200ms
+
+// ═══════════════════════════════════════════════════════════
+// DEFAULT TIMING  (seconds → converted to ms below)
+// ═══════════════════════════════════════════════════════════
+const uint32_t DEFAULT_RED_MS    = 10000;  // 10s red
+const uint32_t DEFAULT_GREEN_MS  =  8000;  // 8s  green
+const uint32_t DEFAULT_YELLOW_MS =  3000;  // 3s  yellow
+
+// ═══════════════════════════════════════════════════════════
+// STATE MACHINE
+// Cycle order: RED → GREEN → YELLOW → (back to RED)
+// ═══════════════════════════════════════════════════════════
+enum LightState { STATE_RED = 0, STATE_GREEN = 1, STATE_YELLOW = 2 };
+
+// nextStateMap[current] = what comes next in the auto cycle
+const LightState nextStateMap[] = {
+  STATE_GREEN,   // after RED  → GREEN
+  STATE_YELLOW,  // after GREEN → YELLOW
+  STATE_RED,     // after YELLOW → RED
+};
+
+const char* stateNames[] = { "RED", "GREEN", "YELLOW" };
+
+LightState currentState   = STATE_RED;
+bool       cycleEnabled   = true;
+uint32_t   stateStartMs   = 0;         // when the current state began
+uint32_t   lastUdpMs      = 0;
+
+uint32_t redIntervalMs    = DEFAULT_RED_MS;
+uint32_t greenIntervalMs  = DEFAULT_GREEN_MS;
+uint32_t yellowIntervalMs = DEFAULT_YELLOW_MS;
+
+// ═══════════════════════════════════════════════════════════
+// OBJECTS
+// ═══════════════════════════════════════════════════════════
+WebServer server(80);
+WiFiUDP   udp;
+
+// ═══════════════════════════════════════════════════════════
+// LOG RING BUFFER  (unchanged from stable v2)
+// ═══════════════════════════════════════════════════════════
+struct LogEntry { uint32_t id; String line; };
+static const size_t LOG_CAP = 80;
+LogEntry logBuf[LOG_CAP];
+size_t   logHead  = 0;
+size_t   logCount = 0;
+uint32_t logId    = 0;
+
+void pushLog(const String& msg) {
+  logId++;
+  String line = "[id=" + String(logId) + "] [t=" + String(millis()) + "ms] " + msg;
+  Serial.println(line);
+  logBuf[logHead] = { logId, line };
+  logHead = (logHead + 1) % LOG_CAP;
+  if (logCount < LOG_CAP) logCount++;
+}
+
+// ═══════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════
+
+// How long the current state is configured to last
+uint32_t currentIntervalMs() {
+  if (currentState == STATE_RED)    return redIntervalMs;
+  if (currentState == STATE_GREEN)  return greenIntervalMs;
+  return yellowIntervalMs;
+}
+
+// Seconds remaining in the current phase (for UDP + /status)
+//
+// AUTO mode: counts down from the configured phase duration to 0.
+// MANUAL mode: the phase never auto-transitions, so "remaining" would lock at
+//   0 once elapsed >= total — the Jetson then sees 0 for the whole manual hold.
+//   Fix: in MANUAL mode return a fixed sentinel (999.0) so the Jetson knows
+//   the light is held indefinitely and does NOT apply the RUSH / LATE_STOP
+//   overrides (which only make sense when a transition is actually coming).
+float secondsRemaining() {
+  if (!cycleEnabled) {
+    // Manual hold — no upcoming transition, report 999 so Jetson uses NORMAL speed
+    return 999.0f;
+  }
+  uint32_t elapsed = millis() - stateStartMs;
+  uint32_t total   = currentIntervalMs();
+  if (elapsed >= total) return 0.0f;
+  return (float)(total - elapsed) / 1000.0f;
+}
+
+// Apply GPIO outputs for a given state
+void applyLights(LightState s) {
+  digitalWrite(RED_LED_PIN,    s == STATE_RED    ? HIGH : LOW);
+  digitalWrite(YELLOW_LED_PIN, s == STATE_YELLOW ? HIGH : LOW);
+  digitalWrite(GREEN_LED_PIN,  s == STATE_GREEN  ? HIGH : LOW);
+}
+
+// Transition to a new state (only logs if actually changing)
+void setState(LightState newState, const char* source) {
+  if (newState == currentState) return;
+  currentState = newState;
+  stateStartMs = millis();
+  applyLights(currentState);
+  pushLog(String("[") + source + "] STATE -> " + stateNames[currentState]);
+}
+
+// Parse a seconds string (decimals allowed) into milliseconds
+bool secondsToMs(const String& s, uint32_t& outMs) {
+  String t = s; t.trim();
+  if (t.length() == 0) return false;
+  float sec = t.toFloat();
+  if (!(sec > 0.0f)) return false;
+  if (sec > 3600.0f) sec = 3600.0f;
+  outMs = (uint32_t)(sec * 1000.0f + 0.5f);
+  if (outMs == 0) outMs = 1;
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════
+// UDP BROADCAST
+// Pure STA mode — both ESP32 and Jetson are on the same hotspot
+// subnet. Broadcasting to 255.255.255.255 reaches the Jetson.
+// Jetson v2i_receiver.py parses this JSON on port 5005.
+// ═══════════════════════════════════════════════════════════
+void sendUdpPacket() {
+  if (WiFi.status() != WL_CONNECTED) return;   // silently skip if not on hotspot yet
+
+  float rem = secondsRemaining();
+  String payload = "{\"state\":\"" + String(stateNames[currentState]) + "\","
+                   "\"seconds_remaining\":" + String(rem, 2) + ","
+                   "\"mode\":\"" + (cycleEnabled ? "AUTO" : "MANUAL") + "\","
+                   "\"timestamp_ms\":" + String(millis()) + "}";
+
+  udp.beginPacket("255.255.255.255", UDP_PORT);
+  udp.print(payload);
+  udp.endPacket();
+}
+
+// ═══════════════════════════════════════════════════════════
+// HTTP HANDLERS
+// ═══════════════════════════════════════════════════════════
+
+void handleRed() {
+  cycleEnabled = false;
+  pushLog("[HTTP] MODE -> MANUAL");
+  setState(STATE_RED, "HTTP");
+  server.send(200, "text/plain", "RED (manual override)");
+}
+
+void handleYellow() {
+  cycleEnabled = false;
+  pushLog("[HTTP] MODE -> MANUAL");
+  setState(STATE_YELLOW, "HTTP");
+  server.send(200, "text/plain", "YELLOW (manual override)");
+}
+
+void handleGreen() {
+  cycleEnabled = false;
+  pushLog("[HTTP] MODE -> MANUAL");
+  setState(STATE_GREEN, "HTTP");
+  server.send(200, "text/plain", "GREEN (manual override)");
+}
+
+void handleCycle() {
+  if (cycleEnabled) {
+    cycleEnabled = false;
+    pushLog("[HTTP] MODE -> MANUAL (PAUSED)");
+    server.send(200, "text/plain", "PAUSED");
+  } else {
+    cycleEnabled = true;
+    stateStartMs = millis();   // reset timer so current state gets its full duration
+    pushLog("[HTTP] MODE -> AUTO (CYCLING)");
+    server.send(200, "text/plain", "CYCLING");
+  }
+}
+
+// /custom?r=10&y=3&g=8  — set individual phase durations in seconds
+// All three parameters are required.
+void handleCustom() {
+  bool hasR = server.hasArg("r");
+  bool hasY = server.hasArg("y");
+  bool hasG = server.hasArg("g");
+
+  if (!hasR || !hasY || !hasG) {
+    server.send(400, "text/plain",
+      "Usage: /custom?r=<red_s>&y=<yellow_s>&g=<green_s>\n"
+      "Example: /custom?r=10&y=3&g=8\n"
+      "Decimals are allowed: /custom?r=10&y=2.5&g=7");
+    return;
+  }
+
+  uint32_t rMs = 0, yMs = 0, gMs = 0;
+  if (!secondsToMs(server.arg("r"), rMs) ||
+      !secondsToMs(server.arg("y"), yMs) ||
+      !secondsToMs(server.arg("g"), gMs)) {
+    server.send(400, "text/plain", "Invalid values. Use positive seconds (decimals OK).");
+    return;
+  }
+
+  redIntervalMs    = rMs;
+  yellowIntervalMs = yMs;
+  greenIntervalMs  = gMs;
+
+  cycleEnabled = true;
+  stateStartMs = millis();
+
+  pushLog("[HTTP] SET TIMING r=" + String(rMs) + "ms y=" + String(yMs) + "ms g=" + String(gMs) + "ms");
+  pushLog("[HTTP] MODE -> AUTO (CUSTOM)");
+
+  server.send(200, "text/plain",
+    "CUSTOM CYCLING SET\n"
+    "RED=" + String(rMs/1000.0f, 1) + "s  "
+    "YELLOW=" + String(yMs/1000.0f, 1) + "s  "
+    "GREEN=" + String(gMs/1000.0f, 1) + "s");
+}
+
+void handleStatus() {
+  float rem = secondsRemaining();
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "not connected";
+  String s = String("state=") + stateNames[currentState] +
+             " mode=" + (cycleEnabled ? "AUTO" : "MANUAL") +
+             " seconds_remaining=" + String(rem, 2) +
+             " r_ms=" + String(redIntervalMs) +
+             " y_ms=" + String(yellowIntervalMs) +
+             " g_ms=" + String(greenIntervalMs) +
+             " last_id=" + String(logId) +
+             " ip=" + ip;
+  server.send(200, "text/plain", s);
+  pushLog("[HTTP] STATUS " + s);
+}
+
+void handleLogs() {
+  uint32_t since = 0;
+  if (server.hasArg("since")) since = (uint32_t)server.arg("since").toInt();
+
+  String out;
+  out.reserve(2000);
+  out += "last_id=" + String(logId) + "\n";
+
+  size_t start = (logHead + LOG_CAP - logCount) % LOG_CAP;
+  for (size_t i = 0; i < logCount; i++) {
+    size_t idx = (start + i) % LOG_CAP;
+    if (logBuf[idx].id > since) out += logBuf[idx].line + "\n";
+  }
+  server.send(200, "text/plain", out);
+}
+
+// /cycle1 .. /cycle9 — sets all three phases to N seconds each
+void handleNotFound() {
+  String uri = server.uri();
+  if (uri.startsWith("/cycle") && uri.length() == 7) {
+    char d = uri.charAt(6);
+    if (d >= '1' && d <= '9') {
+      uint32_t ms = (uint32_t)(d - '0') * 1000UL;
+      redIntervalMs    = ms;
+      yellowIntervalMs = max(ms / 3, (uint32_t)1000);  // yellow = 1/3 of phase, min 1s
+      greenIntervalMs  = ms;
+
+      cycleEnabled = true;
+      stateStartMs = millis();
+
+      pushLog("[HTTP] SET TIMING r=g=" + String(ms) + "ms y=" + String(yellowIntervalMs) + "ms (/cycleN)");
+      pushLog("[HTTP] MODE -> AUTO (/cycleN)");
+      server.send(200, "text/plain",
+        "CYCLE SET: RED=" + String(ms/1000) + "s  YELLOW=" + String(yellowIntervalMs/1000.0f, 1) + "s  GREEN=" + String(ms/1000) + "s");
+      return;
+    }
+  }
+  server.send(404, "text/plain", "Not found.\nValid routes: /red /yellow /green /cycle /cycle1..9 /custom?r=&y=&g= /status /logs?since=");
+}
+
+// ═══════════════════════════════════════════════════════════
+// SERIAL COMMANDS
+// ═══════════════════════════════════════════════════════════
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  char cmd = Serial.read();
+  while (Serial.available()) Serial.read();   // flush rest
+
+  switch (cmd) {
+    case 'r': case 'R':
+      cycleEnabled = false;
+      pushLog("[SERIAL] MODE -> MANUAL");
+      setState(STATE_RED, "SERIAL");
+      break;
+
+    case 'y': case 'Y':
+      cycleEnabled = false;
+      pushLog("[SERIAL] MODE -> MANUAL");
+      setState(STATE_YELLOW, "SERIAL");
+      break;
+
+    case 'g': case 'G':
+      cycleEnabled = false;
+      pushLog("[SERIAL] MODE -> MANUAL");
+      setState(STATE_GREEN, "SERIAL");
+      break;
+
+    case 'c': case 'C':
+      if (cycleEnabled) {
+        cycleEnabled = false;
+        pushLog("[SERIAL] MODE -> MANUAL (PAUSED)");
+      } else {
+        cycleEnabled = true;
+        stateStartMs = millis();
+        pushLog("[SERIAL] MODE -> AUTO (CYCLING)");
+      }
+      break;
+
+    case 's': case 'S':
+      pushLog("[SERIAL] STATUS state=" + String(stateNames[currentState]) +
+              " mode=" + (cycleEnabled ? "AUTO" : "MANUAL") +
+              " sec_remaining=" + String(secondsRemaining(), 2) +
+              " r=" + String(redIntervalMs) +
+              "ms y=" + String(yellowIntervalMs) +
+              "ms g=" + String(greenIntervalMs) + "ms");
+      break;
+
+    default: break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// SETUP
+// ═══════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // GPIO
+  pinMode(RED_LED_PIN,    OUTPUT);
+  pinMode(YELLOW_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN,  OUTPUT);
+
+  // Boot state — RED
+  currentState = STATE_RED;
+  stateStartMs = millis();
+  applyLights(currentState);
+  pushLog("[BOOT] STATE -> RED");
+
+  // ── WiFi: STA mode only — join phone hotspot ──────────────────────
+  // Both ESP32 and Jetson must be on the same hotspot for UDP to work.
+  // If the hotspot isn't up yet, RED LED blinks and we retry every 5s.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(STA_SSID, STA_PASS);
+
+  Serial.print("Connecting to hotspot: ");
+  Serial.println(STA_SSID);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < WIFI_ATTEMPT_MS) {
+      // Blink red LED during connection wait so you can see it's trying
+      digitalWrite(RED_LED_PIN, HIGH); delay(200);
+      digitalWrite(RED_LED_PIN, LOW);  delay(200);
+      Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Hotspot not found — retrying in 5s. Is hotspot on?");
+      delay(5000);
+      WiFi.begin(STA_SSID, STA_PASS);
+    }
+  }
+
+  // Connected — restore RED solid (boot state), log IP
+  applyLights(currentState);
+  pushLog(String("[BOOT] WiFi connected: ") + STA_SSID + " @ " + WiFi.localIP().toString());
+  Serial.println("\nConnected. IP: " + WiFi.localIP().toString());
+
+  // ── UDP ───────────────────────────────────────────────────────────
+  udp.begin(UDP_PORT);
+  pushLog("[BOOT] UDP listening on port " + String(UDP_PORT));
+
+  // ── HTTP routes ───────────────────────────────────────────────────
+  server.on("/red",    handleRed);
+  server.on("/yellow", handleYellow);
+  server.on("/green",  handleGreen);
+  server.on("/cycle",  handleCycle);
+  server.on("/custom", handleCustom);
+  server.on("/status", handleStatus);
+  server.on("/logs",   handleLogs);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  // ── Startup summary ───────────────────────────────────────────────
+  Serial.println("\n=== ESP32 Traffic Light Controller — ACDC Phase 2 ===");
+  Serial.println("LEDs: RED=25  YELLOW=27  GREEN=26");
+  Serial.println("Cycle: RED → GREEN → YELLOW → RED");
+  Serial.println("Timing: RED=" + String(redIntervalMs/1000) + "s  YELLOW=" + String(yellowIntervalMs/1000) + "s  GREEN=" + String(greenIntervalMs/1000) + "s");
+  Serial.println("STA IP: " + WiFi.localIP().toString());
+  Serial.println("\nHTTP (from Mac browser or curl using the STA IP above):");
+  Serial.println("  /red  /yellow  /green  /cycle  /cycle1..9  /custom?r=&y=&g=  /status  /logs?since=");
+  Serial.println("Serial: r=RED  y=YELLOW  g=GREEN  c=cycle  s=status");
+  Serial.println("UDP: port " + String(UDP_PORT) + " every " + String(UDP_INTERVAL_MS) + "ms → Jetson v2i_receiver.py");
+  Serial.println("======================================================\n");
+}
+
+// ═══════════════════════════════════════════════════════════
+// LOOP
+// ═══════════════════════════════════════════════════════════
+void loop() {
+  server.handleClient();
+  handleSerialCommands();
+
+  // ── Auto-cycle ────────────────────────────────────────────
+  if (cycleEnabled && (millis() - stateStartMs >= currentIntervalMs())) {
+    setState(nextStateMap[currentState], "AUTO");
+    // stateStartMs is reset inside setState → no need to set it here
+  }
+
+  // ── UDP broadcast ─────────────────────────────────────────
+  if (millis() - lastUdpMs >= UDP_INTERVAL_MS) {
+    sendUdpPacket();
+    lastUdpMs = millis();
+  }
+}
