@@ -38,7 +38,7 @@ PROFILES = {
         "esc_addr":     0x40,
         "esc_ch":       1,
         "esc_neutral":  307,          # motor stopped — always return here
-        "esc_forward":  325,          # gentle creep (proven; 325-330 usable)
+        "esc_forward":  330,          # demoday-authoritative creep (0409/0423); rush 345
         "notes":        "Proven on 0409/0423/demoday. Single PCA9685 @ 0x40: "
                         "CH0 steer, CH1 ESC. bus 0 dead.",
     },
